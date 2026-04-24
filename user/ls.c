@@ -24,6 +24,28 @@ fmtname(char *path)
   return buf;
 }
 
+char*
+filetype(int type)
+{
+  switch(type){
+  case T_DIR:    return "dir";
+  case T_FILE:   return "file";
+  case T_DEVICE: return "dev";
+  default:       return "???";
+  }
+}
+
+void
+printsize(uint64 size)
+{
+  if(size >= 1048576)
+    printf("%dM", (int)(size / 1048576));
+  else if(size >= 1024)
+    printf("%dK", (int)(size / 1024));
+  else
+    printf("%d", (int)size);
+}
+
 void
 ls(char *path)
 {
@@ -31,6 +53,7 @@ ls(char *path)
   int fd;
   struct dirent de;
   struct stat st;
+  int total = 0;
 
   if((fd = open(path, O_RDONLY)) < 0){
     fprintf(2, "ls: cannot open %s\n", path);
@@ -46,7 +69,9 @@ ls(char *path)
   switch(st.type){
   case T_DEVICE:
   case T_FILE:
-    printf("%s %d %d %d\n", fmtname(path), st.type, st.ino, (int) st.size);
+    printf("%-14s  %-4s  %2d  ", fmtname(path), filetype(st.type), st.nlink);
+    printsize(st.size);
+    printf("\n");
     break;
 
   case T_DIR:
@@ -66,8 +91,38 @@ ls(char *path)
         printf("ls: cannot stat %s\n", buf);
         continue;
       }
-      printf("%s %d %d %d\n", fmtname(buf), st.type, st.ino, (int) st.size);
+      total += st.size;
     }
+    close(fd);
+
+    // Reopen to print details
+    fd = open(path, O_RDONLY);
+    if(fd < 0){
+      fprintf(2, "ls: cannot open %s\n", path);
+      return;
+    }
+
+    // Print header
+    printf("\n");
+    printf("%-14s  %-4s  %2s  %s\n", "Name", "Type", "Ln", "Size");
+    printf("%-14s  %-4s  %2s  %s\n", "----", "----", "--", "----");
+
+    while(read(fd, &de, sizeof(de)) == sizeof(de)){
+      if(de.inum == 0)
+        continue;
+      memmove(p, de.name, DIRSIZ);
+      p[DIRSIZ] = 0;
+      if(stat(buf, &st) < 0){
+        printf("ls: cannot stat %s\n", buf);
+        continue;
+      }
+      printf("%-14s  %-4s  %2d  ", fmtname(buf), filetype(st.type), st.nlink);
+      printsize(st.size);
+      printf("\n");
+    }
+    printf("%-14s  %-4s  %2s  ", "", "=", "");
+    printsize(total);
+    printf(" (total)\n");
     break;
   }
   close(fd);
