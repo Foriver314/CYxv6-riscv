@@ -60,6 +60,11 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void*           kalloc_order(int);
+void            kfree_order(void *, int);
+void            kaddref_order(void *, int);
+void            kaddref(void *);
+int             kgetref(void *);
 
 // log.c
 void            initlog(int, struct superblock*);
