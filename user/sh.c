@@ -3,6 +3,7 @@
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
+#include "kernel/fs.h"
 
 // Parsed command representation
 #define EXEC  1
@@ -54,6 +55,120 @@ void panic(char*);
 struct cmd *parsecmd(char*);
 void runcmd(struct cmd*) __attribute__((noreturn));
 
+#define BACKSPACE_KEY 0x7f
+#define CTRL(x) ((x)-'@')
+
+void
+putc(int fd, char c)
+{
+  write(fd, &c, 1);
+}
+
+void
+erase_char(void)
+{
+  putc(2, '\b');
+  putc(2, ' ');
+  putc(2, '\b');
+}
+
+int
+is_whitespace(char c)
+{
+  return c == ' ' || c == '\t';
+}
+
+int
+prefix_match(char *name, char *prefix, int len)
+{
+  for(int i = 0; i < len; i++){
+    if(name[i] != prefix[i])
+      return 0;
+  }
+  return 1;
+}
+
+// Complete the current word in buf at position *len.
+// Returns the number of characters added.
+int
+complete(char *buf, int *len)
+{
+  int start = *len;
+  while(start > 0 && !is_whitespace(buf[start-1]))
+    start--;
+
+  int word_len = *len - start;
+  if(word_len < 0)
+    word_len = 0;
+
+  char prefix[DIRSIZ+1];
+  memmove(prefix, buf + start, word_len);
+  prefix[word_len] = 0;
+
+  int is_first = 1;
+  for(int i = 0; i < start; i++){
+    if(!is_whitespace(buf[i])){
+      is_first = 0;
+      break;
+    }
+  }
+
+  char *dir = is_first ? "/" : ".";
+  int fd;
+  struct dirent de;
+  char first_match[DIRSIZ+1];
+  int nmatch = 0;
+  int common_len = 0;
+
+  if((fd = open(dir, O_RDONLY)) < 0)
+    return 0;
+
+  while(read(fd, &de, sizeof(de)) == sizeof(de)){
+    if(de.inum == 0)
+      continue;
+    if(word_len == 0 || prefix_match(de.name, prefix, word_len)){
+      char name[DIRSIZ+1];
+      memmove(name, de.name, DIRSIZ);
+      name[DIRSIZ] = 0;
+      int nlen = strlen(name);
+      while(nlen > 0 && name[nlen-1] == ' ')
+        name[--nlen] = 0;
+      if(nlen == 0)
+        continue;
+      if(nmatch == 0){
+        memmove(first_match, name, nlen+1);
+        common_len = nlen;
+      } else {
+        int j = 0;
+        while(j < common_len && name[j] && first_match[j] == name[j])
+          j++;
+        common_len = j;
+      }
+      nmatch++;
+    }
+  }
+  close(fd);
+
+  if(nmatch == 0 || common_len <= word_len)
+    return 0;
+
+  for(int i = 0; i < word_len; i++)
+    erase_char();
+
+  for(int i = 0; i < common_len; i++){
+    putc(2, first_match[i]);
+    buf[start + i] = first_match[i];
+  }
+  *len = start + common_len;
+
+  if(nmatch == 1 && is_first){
+    putc(2, ' ');
+    buf[(*len)++] = ' ';
+  }
+
+  return common_len - word_len;
+}
+
 // Execute cmd.  Never returns.
 void
 runcmd(struct cmd *cmd)
@@ -76,6 +191,7 @@ runcmd(struct cmd *cmd)
     ecmd = (struct execcmd*)cmd;
     if(ecmd->argv[0] == 0)
       exit(1);
+    consolemode(0);
     exec(ecmd->argv[0], ecmd->argv);
     fprintf(2, "exec %s failed\n", ecmd->argv[0]);
     break;
@@ -134,11 +250,45 @@ runcmd(struct cmd *cmd)
 int
 getcmd(char *buf, int nbuf)
 {
+  int i = 0;
+  char c;
+
   write(2, "$ ", 2);
   memset(buf, 0, nbuf);
-  gets(buf, nbuf);
-  if(buf[0] == 0) // EOF
-    return -1;
+
+  while(i < nbuf - 1){
+    if(read(0, &c, 1) != 1)
+      break;
+
+    if(c == '\n' || c == '\r'){
+      putc(2, '\n');
+      buf[i++] = '\n';
+      break;
+    } else if(c == BACKSPACE_KEY || c == '\b'){
+      if(i > 0){
+        erase_char();
+        i--;
+      }
+    } else if(c == CTRL('U')){
+      while(i > 0){
+        erase_char();
+        i--;
+      }
+    } else if(c == CTRL('D')){
+      if(i == 0){
+        return -1;
+      }
+    } else if(c == '\t'){
+      if(i > 0 && !is_whitespace(buf[i-1])){
+        complete(buf, &i);
+      }
+    } else if(c >= 32 && c < 127){
+      putc(2, c);
+      buf[i++] = c;
+    }
+  }
+
+  buf[i] = 0;
   return 0;
 }
 
@@ -156,6 +306,8 @@ main(void)
     }
   }
 
+  consolemode(1);
+
   // Read and run input commands.
   while(getcmd(buf, sizeof(buf)) >= 0){
     char *cmd = buf;
@@ -172,8 +324,11 @@ main(void)
       if(fork1() == 0)
         runcmd(parsecmd(cmd));
       wait(0);
+      consolemode(1);
     }
   }
+
+  consolemode(0);
   exit(0);
 }
 

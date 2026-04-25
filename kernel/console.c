@@ -44,13 +44,14 @@ consputc(int c)
 
 struct {
   struct spinlock lock;
-  
+
   // input circular buffer
 #define INPUT_BUF_SIZE 128
   char buf[INPUT_BUF_SIZE];
   uint r;  // Read index
   uint w;  // Write index
   uint e;  // Edit index
+  int raw; // Raw mode: return chars immediately
 } cons;
 
 //
@@ -104,7 +105,7 @@ consoleread(int user_dst, uint64 dst, int n)
 
     c = cons.buf[cons.r++ % INPUT_BUF_SIZE];
 
-    if(c == C('D')){  // end-of-file
+    if(c == C('D') && !cons.raw){  // end-of-file
       if(n < target){
         // Save ^D for next time, to make sure
         // caller gets a 0-byte result.
@@ -121,9 +122,14 @@ consoleread(int user_dst, uint64 dst, int n)
     dst++;
     --n;
 
-    if(c == '\n'){
+    if(c == '\n' && !cons.raw){
       // a whole line has arrived, return to
       // the user-level read().
+      break;
+    }
+
+    if(cons.raw){
+      // In raw mode, return each character immediately.
       break;
     }
   }
@@ -142,6 +148,17 @@ void
 consoleintr(int c)
 {
   acquire(&cons.lock);
+
+  if(cons.raw){
+    if(c != 0 && cons.e-cons.r < INPUT_BUF_SIZE){
+      c = (c == '\r') ? '\n' : c;
+      cons.buf[cons.e++ % INPUT_BUF_SIZE] = c;
+      cons.w = cons.e;
+      wakeup(&cons.r);
+    }
+    release(&cons.lock);
+    return;
+  }
 
   switch(c){
   case C('P'):  // Print process list.
@@ -180,7 +197,15 @@ consoleintr(int c)
     }
     break;
   }
-  
+
+  release(&cons.lock);
+}
+
+void
+consoleraw(int mode)
+{
+  acquire(&cons.lock);
+  cons.raw = mode;
   release(&cons.lock);
 }
 
