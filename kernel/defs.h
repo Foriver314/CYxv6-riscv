@@ -63,6 +63,7 @@ void            kinit(void);
 void*           kalloc_order(int);
 void            kfree_order(void *, int);
 void            kaddref_order(void *, int);
+void            ksplit_order(void *, int, int);
 void            kaddref(void *);
 int             kgetref(void *);
 
@@ -161,6 +162,7 @@ void            kvminit(void);
 void            kvminithart(void);
 void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
+int             mappages_order(pagetable_t, uint64, uint64, uint64, int, int);
 pagetable_t     uvmcreate(void);
 uint64          uvmalloc(pagetable_t, uint64, uint64, int);
 uint64          uvmdealloc(pagetable_t, uint64, uint64);

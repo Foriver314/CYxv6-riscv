@@ -272,6 +272,46 @@ kaddref_order(void *pa, int order)
   release(&kmem.lock);
 }
 
+// Split allocator metadata for a private allocated order block into
+// smaller allocated blocks. Future COW code must break sharing before
+// demoting a shared superpage.
+void
+ksplit_order(void *pa, int old_order, int new_order)
+{
+  int idx;
+  int i;
+  int npage;
+  int ref;
+
+  if(!valid_order(old_order) || !valid_order(new_order) ||
+     new_order >= old_order ||
+     ((uint64)pa % (PGSIZE << old_order)) != 0)
+    panic("ksplit_order");
+  if(!valid_page((uint64)pa))
+    panic("ksplit_order");
+
+  idx = pa_index((uint64)pa);
+  npage = 1 << old_order;
+  if(idx + npage > KMEM_NPAGE)
+    panic("ksplit_order");
+
+  acquire(&kmem.lock);
+  if(pages[idx].is_free || pages[idx].order != old_order)
+    panic("ksplit_order");
+  ref = pages[idx].ref;
+  if(ref != 1)
+    panic("ksplit_order: shared");
+  for(i = 0; i < npage; i++){
+    if(!pages[idx + i].usable || pages[idx + i].is_free ||
+       pages[idx + i].order != old_order || pages[idx + i].ref != ref ||
+       ref < 1)
+      panic("ksplit_order");
+  }
+  for(i = 0; i < npage; i++)
+    pages[idx + i].order = new_order;
+  release(&kmem.lock);
+}
+
 void
 kaddref(void *pa)
 {

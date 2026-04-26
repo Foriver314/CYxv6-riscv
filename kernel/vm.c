@@ -17,6 +17,27 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+static pte_t *walk_to(pagetable_t, uint64, int, int);
+static pte_t *walk_leaf(pagetable_t, uint64, int *);
+
+static int
+pte_leaf(pte_t pte)
+{
+  return (pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X));
+}
+
+static uint64
+page_size_for_level(int level)
+{
+  return PGSIZE << (9 * level);
+}
+
+static int
+page_order_for_level(int level)
+{
+  return 9 * level;
+}
+
 // Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
@@ -97,12 +118,20 @@ kvminithart()
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
+  return walk_to(pagetable, va, 0, alloc);
+}
+
+static pte_t *
+walk_to(pagetable_t pagetable, uint64 va, int target_level, int alloc)
+{
   if(va >= MAXVA)
     panic("walk");
 
-  for(int level = 2; level > 0; level--) {
+  for(int level = 2; level > target_level; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
+      if(pte_leaf(*pte))
+        return 0;
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
       if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
@@ -111,7 +140,29 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
       *pte = PA2PTE(pagetable) | PTE_V;
     }
   }
-  return &pagetable[PX(0, va)];
+  return &pagetable[PX(target_level, va)];
+}
+
+static pte_t *
+walk_leaf(pagetable_t pagetable, uint64 va, int *levelp)
+{
+  if(va >= MAXVA)
+    panic("walk_leaf");
+
+  for(int level = 2; level >= 0; level--){
+    pte_t *pte = &pagetable[PX(level, va)];
+    if((*pte & PTE_V) == 0)
+      return 0;
+    if(pte_leaf(*pte)){
+      if(levelp)
+        *levelp = level;
+      return pte;
+    }
+    if(level == 0)
+      return 0;
+    pagetable = (pagetable_t)PTE2PA(*pte);
+  }
+  return 0;
 }
 
 // Look up a virtual address, return the physical address,
@@ -122,11 +173,13 @@ walkaddr(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
   uint64 pa;
+  uint64 size;
+  int level;
 
   if(va >= MAXVA)
     return 0;
 
-  pte = walk(pagetable, va, 0);
+  pte = walk_leaf(pagetable, va, &level);
   if(pte == 0)
     return 0;
   if((*pte & PTE_V) == 0)
@@ -134,7 +187,8 @@ walkaddr(pagetable_t pagetable, uint64 va)
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
-  return pa;
+  size = page_size_for_level(level);
+  return pa + (va & (size - 1));
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -145,31 +199,80 @@ walkaddr(pagetable_t pagetable, uint64 va)
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
+  return mappages_order(pagetable, va, size, pa, perm, 0);
+}
+
+int
+mappages_order(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa,
+               int perm, int order)
+{
   uint64 a, last;
   pte_t *pte;
+  uint64 map_size;
+  int level;
 
-  if((va % PGSIZE) != 0)
+  if(order != 0 && order != SUPERPGORDER)
+    panic("mappages_order: order");
+
+  map_size = PGSIZE << order;
+  level = order / 9;
+
+  if((va % map_size) != 0)
     panic("mappages: va not aligned");
 
-  if((size % PGSIZE) != 0)
+  if((pa % map_size) != 0)
+    panic("mappages: pa not aligned");
+
+  if((size % map_size) != 0)
     panic("mappages: size not aligned");
 
   if(size == 0)
     panic("mappages: size");
   
   a = va;
-  last = va + size - PGSIZE;
+  last = va + size - map_size;
   for(;;){
-    if((pte = walk(pagetable, a, 1)) == 0)
+    if((pte = walk_to(pagetable, a, level, 1)) == 0)
       return -1;
     if(*pte & PTE_V)
       panic("mappages: remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
-    a += PGSIZE;
-    pa += PGSIZE;
+    a += map_size;
+    pa += map_size;
   }
+  return 0;
+}
+
+static int
+split_superpage(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  pagetable_t child;
+  uint64 pa;
+  int flags;
+  int level;
+
+  pte = walk_leaf(pagetable, va, &level);
+  if(pte == 0 || level == 0)
+    return 0;
+  if(level != 1)
+    panic("split_superpage: level");
+
+  child = (pagetable_t)kalloc();
+  if(child == 0)
+    return -1;
+  memset(child, 0, PGSIZE);
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+  for(int i = 0; i < 512; i++)
+    child[i] = PA2PTE(pa + (uint64)i * PGSIZE) | flags | PTE_V;
+
+  ksplit_order((void*)pa, SUPERPGORDER, 0);
+  *pte = PA2PTE(child) | PTE_V;
+  sfence_vma();
   return 0;
 }
 
@@ -192,22 +295,41 @@ uvmcreate()
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
-  uint64 a;
+  uint64 a, end, pa, pgsize, base;
   pte_t *pte;
+  int level;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+  end = va + npages*PGSIZE;
+  for(a = va; a < end; ){
+    if((pte = walk_leaf(pagetable, a, &level)) == 0){ // leaf page table entry allocated?
+      a += PGSIZE;
       continue;   
+    }
     if((*pte & PTE_V) == 0)  // has physical page been allocated?
+    {
+      a += PGSIZE;
       continue;
+    }
+
+    pgsize = page_size_for_level(level);
+    base = a & ~(pgsize - 1);
+    if(level > 0 && (a != base || a + pgsize > end)){
+      if(!do_free)
+        panic("uvmunmap: partial superpage");
+      if(split_superpage(pagetable, a) < 0)
+        panic("uvmunmap: split");
+      continue;
+    }
+
     if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      pa = PTE2PA(*pte);
+      kfree_order((void*)pa, page_order_for_level(level));
     }
     *pte = 0;
+    a += pgsize;
   }
 }
 
@@ -218,20 +340,36 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
   char *mem;
   uint64 a;
+  uint64 allocsz;
+  int order;
 
   if(newsz < oldsz)
     return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
-  for(a = oldsz; a < newsz; a += PGSIZE){
-    mem = kalloc();
+  for(a = oldsz; a < newsz; a += allocsz){
+    if((a % SUPERPGSIZE) == 0 && newsz - a >= SUPERPGSIZE){
+      order = SUPERPGORDER;
+      allocsz = SUPERPGSIZE;
+      mem = kalloc_order(order);
+      if(mem == 0){
+        order = 0;
+        allocsz = PGSIZE;
+        mem = kalloc();
+      }
+    } else {
+      order = 0;
+      allocsz = PGSIZE;
+      mem = kalloc();
+    }
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
-    memset(mem, 0, PGSIZE);
-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
-      kfree(mem);
+    memset(mem, 0, allocsz);
+    if(mappages_order(pagetable, a, allocsz, (uint64)mem,
+                      PTE_R|PTE_U|xperm, order) != 0){
+      kfree_order(mem, order);
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
@@ -298,21 +436,44 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
+  uint64 pgsize;
   uint flags;
   char *mem;
+  int level;
+  int order;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+  for(i = 0; i < sz; i += pgsize){
+    if((pte = walk_leaf(old, i, &level)) == 0){
+      pgsize = PGSIZE;
       continue;   // page table entry hasn't been allocated
-    if((*pte & PTE_V) == 0)
+    }
+    if((*pte & PTE_V) == 0){
+      pgsize = PGSIZE;
       continue;   // physical page hasn't been allocated
-    pa = PTE2PA(*pte);
+    }
+
+    pgsize = page_size_for_level(level);
+    if(level > 0 && ((i & (pgsize - 1)) != 0 || i + pgsize > sz)){
+      pa = walkaddr(old, i);
+      pgsize = PGSIZE;
+      order = 0;
+    } else {
+      pa = PTE2PA(*pte);
+      order = page_order_for_level(level);
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    mem = kalloc_order(order);
+    if(mem == 0 && order > 0){
+      pa = walkaddr(old, i);
+      pgsize = PGSIZE;
+      order = 0;
+      mem = kalloc();
+    }
+    if(mem == 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    memmove(mem, (char*)pa, pgsize);
+    if(mappages_order(new, i, pgsize, (uint64)mem, flags, order) != 0){
+      kfree_order(mem, order);
       goto err;
     }
   }
@@ -329,10 +490,18 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
-  pte = walk(pagetable, va, 0);
+  int level;
+
+  pte = walk_leaf(pagetable, va, &level);
   if(pte == 0)
     panic("uvmclear");
+  if(level > 0){
+    if(split_superpage(pagetable, va) < 0)
+      panic("uvmclear");
+    pte = walk(pagetable, va, 0);
+    if(pte == 0)
+      panic("uvmclear");
+  }
   *pte &= ~PTE_U;
 }
 
@@ -357,9 +526,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       }
     }
 
-    pte = walk(pagetable, va0, 0);
+    pte = walk_leaf(pagetable, va0, 0);
     // forbid copyout over read-only user text pages.
-    if((*pte & PTE_W) == 0)
+    if(pte == 0 || (*pte & PTE_W) == 0)
       return -1;
       
     n = PGSIZE - (dstva - va0);
@@ -475,7 +644,7 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 int
 ismapped(pagetable_t pagetable, uint64 va)
 {
-  pte_t *pte = walk(pagetable, va, 0);
+  pte_t *pte = walk_leaf(pagetable, va, 0);
   if (pte == 0) {
     return 0;
   }
