@@ -19,6 +19,8 @@ extern char trampoline[]; // trampoline.S
 
 static pte_t *walk_to(pagetable_t, uint64, int, int);
 static pte_t *walk_leaf(pagetable_t, uint64, int *);
+static uint64 cowcopy(pagetable_t, uint64);
+static int cowensure(pagetable_t, uint64, uint64 *);
 
 static int
 pte_leaf(pte_t pte)
@@ -276,6 +278,64 @@ split_superpage(pagetable_t pagetable, uint64 va)
   return 0;
 }
 
+static uint64
+cowcopy(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint64 mem;
+  uint64 size;
+  uint flags;
+  int level;
+  int order;
+
+  pte = walk_leaf(pagetable, va, &level);
+  if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_COW) == 0)
+    return 0;
+
+  pa = PTE2PA(*pte);
+  order = page_order_for_level(level);
+  if(kgetref((void*)pa) == 1){
+    *pte = (*pte | PTE_W) & ~PTE_COW;
+    sfence_vma();
+    return pa + (va & (page_size_for_level(level) - 1));
+  }
+
+  size = page_size_for_level(level);
+  mem = (uint64)kalloc_order(order);
+  if(mem == 0)
+    return 0;
+  memmove((void*)mem, (void*)pa, size);
+
+  flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+  *pte = PA2PTE(mem) | flags;
+  sfence_vma();
+  kfree_order((void*)pa, order);
+  return mem + (va & (size - 1));
+}
+
+static int
+cowensure(pagetable_t pagetable, uint64 va, uint64 *pa0)
+{
+  pte_t *pte;
+  int level;
+
+  pte = walk_leaf(pagetable, va, &level);
+  if(pte == 0 || (*pte & PTE_V) == 0)
+    return -1;
+  if(*pte & PTE_W){
+    if(pa0)
+      *pa0 = PTE2PA(*pte) + (va & (page_size_for_level(level) - 1));
+    return 0;
+  }
+  if((*pte & PTE_COW) == 0)
+    return -1;
+  if(pa0 == 0)
+    return cowcopy(pagetable, va) ? 0 : -1;
+  *pa0 = cowcopy(pagetable, va);
+  return *pa0 ? 0 : -1;
+}
+
 // create an empty user page table.
 // returns 0 if out of memory.
 pagetable_t
@@ -319,6 +379,8 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     if(level > 0 && (a != base || a + pgsize > end)){
       if(!do_free)
         panic("uvmunmap: partial superpage");
+      if((*pte & PTE_COW) && cowcopy(pagetable, a) == 0)
+        panic("uvmunmap: cowcopy");
       if(split_superpage(pagetable, a) < 0)
         panic("uvmunmap: split");
       continue;
@@ -427,8 +489,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
+// Writable pages become shared COW mappings.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -438,45 +499,35 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uint64 pa, i;
   uint64 pgsize;
   uint flags;
-  char *mem;
   int level;
   int order;
 
   for(i = 0; i < sz; i += pgsize){
     if((pte = walk_leaf(old, i, &level)) == 0){
       pgsize = PGSIZE;
-      continue;   // page table entry hasn't been allocated
+      continue;
     }
     if((*pte & PTE_V) == 0){
       pgsize = PGSIZE;
-      continue;   // physical page hasn't been allocated
+      continue;
     }
 
     pgsize = page_size_for_level(level);
-    if(level > 0 && ((i & (pgsize - 1)) != 0 || i + pgsize > sz)){
-      pa = walkaddr(old, i);
-      pgsize = PGSIZE;
-      order = 0;
-    } else {
-      pa = PTE2PA(*pte);
-      order = page_order_for_level(level);
-    }
+    if(level > 0 && ((i & (pgsize - 1)) != 0 || i + pgsize > sz))
+      panic("uvmcopy: partial superpage");
+
+    pa = PTE2PA(*pte);
+    order = page_order_for_level(level);
     flags = PTE_FLAGS(*pte);
-    mem = kalloc_order(order);
-    if(mem == 0 && order > 0){
-      pa = walkaddr(old, i);
-      pgsize = PGSIZE;
-      order = 0;
-      mem = kalloc();
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
     }
-    if(mem == 0)
+    if(mappages_order(new, i, pgsize, pa, flags, order) != 0)
       goto err;
-    memmove(mem, (char*)pa, pgsize);
-    if(mappages_order(new, i, pgsize, (uint64)mem, flags, order) != 0){
-      kfree_order(mem, order);
-      goto err;
-    }
+    kaddref_order((void*)pa, order);
   }
+  sfence_vma();
   return 0;
 
  err:
@@ -512,25 +563,21 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 0)) == 0)
         return -1;
-      }
     }
 
-    pte = walk_leaf(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
-    if(pte == 0 || (*pte & PTE_W) == 0)
+    if(cowensure(pagetable, va0, &pa0) < 0)
       return -1;
-      
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -615,21 +662,27 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 // allocate and map user memory if process is referencing a page
-// that was lazily allocated in sys_sbrk().
-// returns 0 if va is invalid or already mapped, or if
-// out of physical memory, and physical address if successful.
+// that was lazily allocated in sys_sbrk(), or resolve a COW write fault.
+// returns 0 if va is invalid or cannot be serviced, and physical address if successful.
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
+  pte_t *pte;
+  int level;
   struct proc *p = myproc();
 
   if (va >= p->sz)
     return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+
+  pte = walk_leaf(pagetable, va, &level);
+  if(pte && (*pte & PTE_V)){
+    if(!read && (*pte & PTE_COW))
+      return cowcopy(pagetable, va);
     return 0;
   }
+
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;

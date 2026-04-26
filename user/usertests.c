@@ -2748,6 +2748,116 @@ lazy_sbrk(char *s)
   exit(0);
 }
 
+#define COWISO_SMALLPAGES 16
+#define COWISO_MARKS 3
+
+static void
+cowiso_region(char *s, char *name, char *region, uint64 size)
+{
+  int p[2];
+  int pid;
+  int status;
+  int marks[COWISO_MARKS] = {0, size / 2, size - 1};
+  char before[COWISO_MARKS];
+  char childvals[COWISO_MARKS];
+
+  for(int i = 0; i < COWISO_MARKS; i++)
+    before[i] = region[marks[i]];
+
+  if(pipe(p) < 0){
+    printf("%s: pipe failed for %s\n", s, name);
+    exit(1);
+  }
+
+  pid = fork();
+  if(pid < 0){
+    printf("%s: fork failed for %s\n", s, name);
+    exit(1);
+  }
+
+  if(pid == 0){
+    close(p[0]);
+    for(int i = 0; i < COWISO_MARKS; i++){
+      region[marks[i]] = 'a' + i;
+      childvals[i] = region[marks[i]];
+    }
+    if(write(p[1], childvals, sizeof(childvals)) != sizeof(childvals))
+      exit(2);
+    close(p[1]);
+    exit(0);
+  }
+
+  close(p[1]);
+  if(read(p[0], childvals, sizeof(childvals)) != sizeof(childvals)){
+    close(p[0]);
+    wait(&status);
+    printf("%s: short read for %s\n", s, name);
+    exit(1);
+  }
+  close(p[0]);
+
+  if(wait(&status) < 0 || status != 0){
+    printf("%s: child failed for %s\n", s, name);
+    exit(1);
+  }
+
+  for(int i = 0; i < COWISO_MARKS; i++){
+    if(region[marks[i]] != before[i]){
+      printf("%s: parent changed in %s at %d\n", s, name, marks[i]);
+      exit(1);
+    }
+    if(childvals[i] != 'a' + i){
+      printf("%s: child value mismatch in %s at %d\n", s, name, marks[i]);
+      exit(1);
+    }
+  }
+}
+
+void
+cowiso(char *s)
+{
+  char *small;
+  char *base;
+  char *pad;
+  char *super;
+  int offset;
+
+  small = sbrk(COWISO_SMALLPAGES * PGSIZE);
+  if(small == SBRK_ERROR){
+    printf("%s: small sbrk failed\n", s);
+    exit(1);
+  }
+  for(int i = 0; i < COWISO_SMALLPAGES * PGSIZE; i += PGSIZE)
+    small[i] = 's';
+  small[COWISO_SMALLPAGES * PGSIZE - 1] = 'S';
+  cowiso_region(s, "small-page", small, COWISO_SMALLPAGES * PGSIZE);
+
+  base = sbrk(0);
+  offset = (int)((uint64)base % SUPERPGSIZE);
+  if(offset != 0){
+    pad = sbrk(SUPERPGSIZE - offset);
+    if(pad == SBRK_ERROR){
+      printf("%s: superpage align failed\n", s);
+      exit(1);
+    }
+    for(int i = 0; i < SUPERPGSIZE - offset; i += PGSIZE)
+      pad[i] = 'p';
+  }
+
+  super = sbrk(SUPERPGSIZE);
+  if(super == SBRK_ERROR){
+    printf("%s: superpage alloc failed\n", s);
+    exit(1);
+  }
+  for(int i = 0; i < SUPERPGSIZE; i += PGSIZE)
+    super[i] = 'u';
+  super[SUPERPGSIZE / 2] = 'm';
+  super[SUPERPGSIZE - 1] = 'U';
+  cowiso_region(s, "superpage-candidate", super, SUPERPGSIZE);
+
+  exit(0);
+}
+
 struct test {
   void (*f)(char *);
   char *s;
@@ -2816,6 +2926,7 @@ struct test {
   {lazy_unmap, "lazy_unmap"},
   {lazy_copy, "lazy_copy"},
   {lazy_sbrk, "lazy_sbrk"},
+  {cowiso, "cowiso"},
   { 0, 0},
 };
 
