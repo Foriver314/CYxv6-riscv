@@ -21,3 +21,8 @@
 #define SYS_mkdir  20
 #define SYS_close  21
 #define SYS_consolemode 22
+#define SYS_rwlock_alloc 23
+#define SYS_rwlock_rdlock 24
+#define SYS_rwlock_wrlock 25
+#define SYS_rwlock_unlock 26
+#define SYS_rwlock_free 27

@@ -18,10 +18,12 @@ OBJS = \
   $K/trap.o \
   $K/syscall.o \
   $K/sysproc.o \
+  $K/sysrwlock.o \
   $K/bio.o \
   $K/fs.o \
   $K/log.o \
   $K/sleeplock.o \
+  $K/rwlock.o \
   $K/file.o \
   $K/pipe.o \
   $K/exec.o \
@@ -149,6 +151,7 @@ UPROGS=\
 	$U/_cowiso\
 	$U/_cowbench\
 	$U/_kallocbench\
+	$U/_rwbench\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

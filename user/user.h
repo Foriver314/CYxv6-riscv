@@ -25,6 +25,11 @@ char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
 int consolemode(int);
+int rwlock_alloc(void);
+int rwlock_rdlock(int);
+int rwlock_wrlock(int);
+int rwlock_unlock(int);
+int rwlock_free(int);
 
 // ulib.c
 int stat(const char*, struct stat*);

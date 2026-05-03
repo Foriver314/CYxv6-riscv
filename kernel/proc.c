@@ -345,6 +345,8 @@ kexit(int status)
   end_op();
   p->cwd = 0;
 
+  rwlock_proc_cleanup(p);
+
   acquire(&wait_lock);
 
   // Give any children to init.

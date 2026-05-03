@@ -43,3 +43,8 @@ entry("sbrk");
 entry("pause");
 entry("uptime");
 entry("consolemode");
+entry("rwlock_alloc");
+entry("rwlock_rdlock");
+entry("rwlock_wrlock");
+entry("rwlock_unlock");
+entry("rwlock_free");

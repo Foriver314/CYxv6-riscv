@@ -2858,6 +2858,381 @@ cowiso(char *s)
   exit(0);
 }
 
+static char
+rwread1(char *s, int fd)
+{
+  char c;
+
+  if(read(fd, &c, 1) != 1){
+    printf("%s: short pipe read\n", s);
+    exit(1);
+  }
+  return c;
+}
+
+void
+rwlockreaders(char *s)
+{
+  int id, p1[2], p2[2], pid1, pid2, status;
+  uint start, elapsed;
+
+  id = rwlock_alloc();
+  if(id < 0 || pipe(p1) < 0 || pipe(p2) < 0){
+    printf("%s: setup failed\n", s);
+    exit(1);
+  }
+
+  pid1 = fork();
+  if(pid1 < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pid1 == 0){
+    close(p1[0]);
+    close(p2[0]);
+    close(p2[1]);
+    if(rwlock_rdlock(id) < 0)
+      exit(1);
+    if(write(p1[1], "a", 1) != 1)
+      exit(1);
+    pause(50);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(p1[1]);
+  if(rwread1(s, p1[0]) != 'a'){
+    printf("%s: first reader did not enter\n", s);
+    exit(1);
+  }
+  close(p1[0]);
+
+  pid2 = fork();
+  if(pid2 < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pid2 == 0){
+    close(p2[0]);
+    if(rwlock_rdlock(id) < 0)
+      exit(1);
+    if(write(p2[1], "b", 1) != 1)
+      exit(1);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(p2[1]);
+  start = uptime();
+  if(rwread1(s, p2[0]) != 'b'){
+    printf("%s: second reader did not enter\n", s);
+    exit(1);
+  }
+  elapsed = uptime() - start;
+  close(p2[0]);
+  if(elapsed >= 35){
+    printf("%s: readers did not run concurrently\n", s);
+    exit(1);
+  }
+
+  for(int i = 0; i < 2; i++){
+    if(wait(&status) < 0 || status != 0){
+      printf("%s: child failed\n", s);
+      exit(1);
+    }
+  }
+  if(rwlock_free(id) < 0){
+    printf("%s: free failed\n", s);
+    exit(1);
+  }
+}
+
+void
+rwlockwriter(char *s)
+{
+  int id, wp[2], rp[2], pidw, pidr, status;
+  uint start, elapsed;
+
+  id = rwlock_alloc();
+  if(id < 0 || pipe(wp) < 0 || pipe(rp) < 0){
+    printf("%s: setup failed\n", s);
+    exit(1);
+  }
+
+  pidw = fork();
+  if(pidw < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pidw == 0){
+    close(wp[0]);
+    close(rp[0]);
+    close(rp[1]);
+    if(rwlock_wrlock(id) < 0)
+      exit(1);
+    if(write(wp[1], "w", 1) != 1)
+      exit(1);
+    pause(40);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(wp[1]);
+  if(rwread1(s, wp[0]) != 'w'){
+    printf("%s: writer did not enter\n", s);
+    exit(1);
+  }
+  close(wp[0]);
+
+  pidr = fork();
+  if(pidr < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pidr == 0){
+    close(rp[0]);
+    if(rwlock_rdlock(id) < 0)
+      exit(1);
+    if(write(rp[1], "r", 1) != 1)
+      exit(1);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(rp[1]);
+  start = uptime();
+  if(rwread1(s, rp[0]) != 'r'){
+    printf("%s: reader did not enter\n", s);
+    exit(1);
+  }
+  elapsed = uptime() - start;
+  close(rp[0]);
+  if(elapsed < 25){
+    printf("%s: writer did not exclude reader\n", s);
+    exit(1);
+  }
+
+  for(int i = 0; i < 2; i++){
+    if(wait(&status) < 0 || status != 0){
+      printf("%s: child failed\n", s);
+      exit(1);
+    }
+  }
+  if(rwlock_free(id) < 0){
+    printf("%s: free failed\n", s);
+    exit(1);
+  }
+}
+
+void
+rwlockfair(char *s)
+{
+  int id, ap[2], ep[2], wp[2], pida, pidw, pidb, status;
+  char first, second;
+
+  id = rwlock_alloc();
+  if(id < 0 || pipe(ap) < 0 || pipe(ep) < 0 || pipe(wp) < 0){
+    printf("%s: setup failed\n", s);
+    exit(1);
+  }
+
+  pida = fork();
+  if(pida < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pida == 0){
+    close(ap[0]);
+    close(ep[0]);
+    close(ep[1]);
+    close(wp[0]);
+    close(wp[1]);
+    if(rwlock_rdlock(id) < 0)
+      exit(1);
+    if(write(ap[1], "a", 1) != 1)
+      exit(1);
+    pause(60);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(ap[1]);
+  if(rwread1(s, ap[0]) != 'a'){
+    printf("%s: first reader did not enter\n", s);
+    exit(1);
+  }
+  close(ap[0]);
+
+  pidw = fork();
+  if(pidw < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pidw == 0){
+    close(ep[0]);
+    close(wp[0]);
+    if(write(wp[1], "q", 1) != 1)
+      exit(1);
+    if(rwlock_wrlock(id) < 0)
+      exit(1);
+    if(write(ep[1], "w", 1) != 1)
+      exit(1);
+    pause(5);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(wp[1]);
+  if(rwread1(s, wp[0]) != 'q'){
+    printf("%s: writer did not queue\n", s);
+    exit(1);
+  }
+  close(wp[0]);
+  pause(5);
+
+  pidb = fork();
+  if(pidb < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pidb == 0){
+    close(ep[0]);
+    if(rwlock_rdlock(id) < 0)
+      exit(1);
+    if(write(ep[1], "b", 1) != 1)
+      exit(1);
+    if(rwlock_unlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+
+  close(ep[1]);
+  first = rwread1(s, ep[0]);
+  second = rwread1(s, ep[0]);
+  close(ep[0]);
+  if(first != 'w' || second != 'b'){
+    printf("%s: queued writer did not run before later reader\n", s);
+    exit(1);
+  }
+
+  for(int i = 0; i < 3; i++){
+    if(wait(&status) < 0 || status != 0){
+      printf("%s: child failed\n", s);
+      exit(1);
+    }
+  }
+  if(rwlock_free(id) < 0){
+    printf("%s: free failed\n", s);
+    exit(1);
+  }
+}
+
+void
+rwlockexit(char *s)
+{
+  int id, pid, status;
+
+  id = rwlock_alloc();
+  if(id < 0){
+    printf("%s: alloc failed\n", s);
+    exit(1);
+  }
+
+  pid = fork();
+  if(pid < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pid == 0){
+    if(rwlock_wrlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+  if(wait(&status) < 0 || status != 0){
+    printf("%s: writer child failed\n", s);
+    exit(1);
+  }
+  if(rwlock_wrlock(id) < 0 || rwlock_unlock(id) < 0){
+    printf("%s: writer exit cleanup failed\n", s);
+    exit(1);
+  }
+
+  pid = fork();
+  if(pid < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pid == 0){
+    if(rwlock_rdlock(id) < 0)
+      exit(1);
+    exit(0);
+  }
+  if(wait(&status) < 0 || status != 0){
+    printf("%s: reader child failed\n", s);
+    exit(1);
+  }
+  if(rwlock_wrlock(id) < 0 || rwlock_unlock(id) < 0){
+    printf("%s: reader exit cleanup failed\n", s);
+    exit(1);
+  }
+
+  if(rwlock_free(id) < 0){
+    printf("%s: free failed\n", s);
+    exit(1);
+  }
+}
+
+void
+rwlockbad(char *s)
+{
+  int id;
+
+  if(rwlock_rdlock(-1) != -1 || rwlock_wrlock(9999) != -1){
+    printf("%s: invalid handle accepted\n", s);
+    exit(1);
+  }
+
+  id = rwlock_alloc();
+  if(id < 0){
+    printf("%s: alloc failed\n", s);
+    exit(1);
+  }
+  if(rwlock_unlock(id) != -1){
+    printf("%s: unlock by non-owner succeeded\n", s);
+    exit(1);
+  }
+  if(rwlock_rdlock(id) < 0){
+    printf("%s: rdlock failed\n", s);
+    exit(1);
+  }
+  if(rwlock_rdlock(id) != -1 || rwlock_wrlock(id) != -1){
+    printf("%s: recursive lock succeeded\n", s);
+    exit(1);
+  }
+  if(rwlock_free(id) != -1){
+    printf("%s: free while held succeeded\n", s);
+    exit(1);
+  }
+  if(rwlock_unlock(id) < 0){
+    printf("%s: unlock failed\n", s);
+    exit(1);
+  }
+  if(rwlock_free(id) < 0){
+    printf("%s: free failed\n", s);
+    exit(1);
+  }
+  if(rwlock_rdlock(id) != -1 || rwlock_unlock(id) != -1 || rwlock_free(id) != -1){
+    printf("%s: freed handle accepted\n", s);
+    exit(1);
+  }
+}
+
 struct test {
   void (*f)(char *);
   char *s;
@@ -2927,6 +3302,11 @@ struct test {
   {lazy_copy, "lazy_copy"},
   {lazy_sbrk, "lazy_sbrk"},
   {cowiso, "cowiso"},
+  {rwlockreaders, "rwlockreaders"},
+  {rwlockwriter, "rwlockwriter"},
+  {rwlockfair, "rwlockfair"},
+  {rwlockexit, "rwlockexit"},
+  {rwlockbad, "rwlockbad"},
   { 0, 0},
 };
 

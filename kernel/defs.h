@@ -4,6 +4,7 @@ struct file;
 struct inode;
 struct pipe;
 struct proc;
+struct rwlock;
 struct spinlock;
 struct sleeplock;
 struct stat;
@@ -125,6 +126,20 @@ void            acquiresleep(struct sleeplock*);
 void            releasesleep(struct sleeplock*);
 int             holdingsleep(struct sleeplock*);
 void            initsleeplock(struct sleeplock*, char*);
+
+// rwlock.c
+void            initrwlock(struct rwlock*, char*);
+int             acquireread(struct rwlock*);
+void            releaseread(struct rwlock*);
+int             acquirewrite(struct rwlock*);
+void            releasewrite(struct rwlock*);
+int             holdingread(struct rwlock*);
+int             holdingwrite(struct rwlock*);
+int             rwlock_isidle(struct rwlock*);
+
+// sysrwlock.c
+void            rwlockinit(void);
+void            rwlock_proc_cleanup(struct proc*);
 
 // string.c
 int             memcmp(const void*, const void*, uint);
