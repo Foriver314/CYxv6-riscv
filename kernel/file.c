@@ -9,6 +9,7 @@
 #include "fs.h"
 #include "spinlock.h"
 #include "sleeplock.h"
+#include "rwlock.h"
 #include "file.h"
 #include "stat.h"
 #include "proc.h"
@@ -22,7 +23,11 @@ struct {
 void
 fileinit(void)
 {
+  struct file *f;
+
   initlock(&ftable.lock, "ftable");
+  for(f = ftable.file; f < ftable.file + NFILE; f++)
+    initsleeplock(&f->offlock, "fileoff");
 }
 
 // Allocate a file structure.
@@ -89,11 +94,19 @@ filestat(struct file *f, uint64 addr)
 {
   struct proc *p = myproc();
   struct stat st;
-  
+  int locked;
+
   if(f->type == FD_INODE || f->type == FD_DEVICE){
-    ilock(f->ip);
+    locked = 0;
+    if(ilock_read(f->ip) < 0){
+      ilock(f->ip);
+      locked = 1;
+    }
     stati(f->ip, &st);
-    iunlock(f->ip);
+    if(locked)
+      iunlock(f->ip);
+    else
+      iunlock_read(f->ip);
     if(copyout(p->pagetable, addr, (char *)&st, sizeof(st)) < 0)
       return -1;
     return 0;
@@ -107,6 +120,7 @@ int
 fileread(struct file *f, uint64 addr, int n)
 {
   int r = 0;
+  int locked;
 
   if(f->readable == 0)
     return -1;
@@ -118,10 +132,19 @@ fileread(struct file *f, uint64 addr, int n)
       return -1;
     r = devsw[f->major].read(1, addr, n);
   } else if(f->type == FD_INODE){
-    ilock(f->ip);
+    acquiresleep(&f->offlock);
+    locked = 0;
+    if(ilock_read(f->ip) < 0){
+      ilock(f->ip);
+      locked = 1;
+    }
     if((r = readi(f->ip, 1, addr, f->off, n)) > 0)
       f->off += r;
-    iunlock(f->ip);
+    if(locked)
+      iunlock(f->ip);
+    else
+      iunlock_read(f->ip);
+    releasesleep(&f->offlock);
   } else {
     panic("fileread");
   }
@@ -152,6 +175,7 @@ filewrite(struct file *f, uint64 addr, int n)
     // and 2 blocks of slop for non-aligned writes.
     int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
     int i = 0;
+    acquiresleep(&f->offlock);
     while(i < n){
       int n1 = n - i;
       if(n1 > max)
@@ -170,6 +194,7 @@ filewrite(struct file *f, uint64 addr, int n)
       }
       i += r;
     }
+    releasesleep(&f->offlock);
     ret = (i == n ? n : -1);
   } else {
     panic("filewrite");

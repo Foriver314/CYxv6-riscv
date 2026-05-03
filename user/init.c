@@ -4,6 +4,7 @@
 #include "kernel/stat.h"
 #include "kernel/spinlock.h"
 #include "kernel/sleeplock.h"
+#include "kernel/rwlock.h"
 #include "kernel/fs.h"
 #include "kernel/file.h"
 #include "user/user.h"

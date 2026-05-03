@@ -1,4 +1,7 @@
 #include "kernel/types.h"
+#include "kernel/stat.h"
+#include "kernel/fcntl.h"
+#include "kernel/fs.h"
 #include "user/user.h"
 
 #define NWORKER 6
@@ -6,6 +9,8 @@
 #define START_DELAY 20
 #define DATA_ITEMS 256
 #define WORK_ITERS 4096
+#define FS_RUN_TICKS 100
+#define FS_FILE_BLOCKS 8
 
 static int data[DATA_ITEMS];
 static volatile int sink;
@@ -14,6 +19,8 @@ static int bench_start;
 static int bench_stop;
 static int bench_writes_per_ten;
 static int bench_exclusive;
+static int fs_start;
+static int fs_stop;
 
 static void
 initdata(void)
@@ -30,6 +37,29 @@ work(int salt)
   for(int i = 0; i < WORK_ITERS; i++)
     acc += data[(i + salt) & (DATA_ITEMS - 1)];
   sink = acc;
+}
+
+static void
+make_fs_file(void)
+{
+  int fd;
+  char block[BSIZE];
+
+  unlink("rwbenchfile");
+  fd = open("rwbenchfile", O_CREATE|O_WRONLY);
+  if(fd < 0){
+    printf("rwbench: create rwbenchfile failed\n");
+    exit(1);
+  }
+  for(int i = 0; i < sizeof(block); i++)
+    block[i] = i;
+  for(int i = 0; i < FS_FILE_BLOCKS; i++){
+    if(write(fd, block, sizeof(block)) != sizeof(block)){
+      printf("rwbench: write rwbenchfile failed\n");
+      exit(1);
+    }
+  }
+  close(fd);
 }
 
 static void
@@ -132,6 +162,112 @@ run_once(char *name, int writes_per_ten, int exclusive, int *totalp, int *ticksp
 }
 
 static void
+fs_worker(int pipefd, int id)
+{
+  int fd;
+  int rounds = 0;
+  int failed = 0;
+  char buf[BSIZE];
+  struct stat st;
+
+  fd = open("rwbenchfile", O_RDONLY);
+  if(fd < 0)
+    exit(1);
+
+  while(uptime() < fs_start)
+    pause(1);
+
+  while(uptime() < fs_stop){
+    int n;
+
+    if(fstat(fd, &st) < 0){
+      failed = 1;
+      break;
+    }
+    n = read(fd, buf, sizeof(buf));
+    if(n < 0){
+      failed = 1;
+      break;
+    }
+    if(n == 0){
+      close(fd);
+      fd = open("rwbenchfile", O_RDONLY);
+      if(fd < 0){
+        failed = 1;
+        break;
+      }
+      continue;
+    }
+    sink += buf[(rounds + id) & (sizeof(buf) - 1)] + st.size;
+    rounds++;
+  }
+
+  close(fd);
+  if(failed)
+    rounds = -1;
+  if(write(pipefd, &rounds, sizeof(rounds)) != sizeof(rounds))
+    exit(1);
+  exit(0);
+}
+
+static void
+measure_fs(void)
+{
+  int p[2];
+  int pid;
+  int status;
+  int rounds;
+  int total = 0;
+  int failed = 0;
+  int ticks;
+
+  make_fs_file();
+  fs_start = uptime() + START_DELAY;
+  fs_stop = fs_start + FS_RUN_TICKS;
+
+  if(pipe(p) < 0)
+    exit(1);
+  for(int i = 0; i < NWORKER; i++){
+    pid = fork();
+    if(pid < 0){
+      failed = 1;
+      break;
+    }
+    if(pid == 0){
+      close(p[0]);
+      fs_worker(p[1], i);
+    }
+  }
+  close(p[1]);
+
+  for(int i = 0; i < NWORKER; i++){
+    if(read(p[0], &rounds, sizeof(rounds)) != sizeof(rounds)){
+      failed = 1;
+      break;
+    }
+    if(rounds < 0)
+      failed = 1;
+    else
+      total += rounds;
+  }
+  close(p[0]);
+
+  for(int i = 0; i < NWORKER; i++){
+    if(wait(&status) < 0 || status != 0)
+      failed = 1;
+  }
+
+  ticks = uptime() - fs_start;
+  unlink("rwbenchfile");
+  if(failed || ticks <= 0){
+    printf("rwbench: fsread failed\n");
+    exit(1);
+  }
+  printf("rwbench: fsread     workers %d rounds %d ticks %d ops_per_tick_x100 %d\n",
+         NWORKER, total, ticks, total * 100 / ticks);
+}
+
+static void
 measure(char *name, int writes_per_ten)
 {
   int exclusive_total;
@@ -174,6 +310,7 @@ main(void)
   measure("balanced", 5);
   measure("writemostly", 9);
   measure("writeonly", 10);
+  measure_fs();
   printf("rwbench: PASS\n");
   exit(0);
 }

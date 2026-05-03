@@ -13,6 +13,7 @@
 #include "proc.h"
 #include "fs.h"
 #include "sleeplock.h"
+#include "rwlock.h"
 #include "file.h"
 #include "fcntl.h"
 

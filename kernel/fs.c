@@ -17,6 +17,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "sleeplock.h"
+#include "rwlock.h"
 #include "fs.h"
 #include "buf.h"
 #include "file.h"
@@ -170,9 +171,9 @@ bfree(int dev, uint b)
 // and ip->dev and ip->inum indicate which i-node an entry
 // holds, one must hold itable.lock while using any of those fields.
 //
-// An ip->lock sleep-lock protects all ip-> fields other than ref,
-// dev, and inum.  One must hold ip->lock in order to
-// read or write that inode's ip->valid, ip->size, ip->type, &c.
+// An ip->lock rwlock protects all ip-> fields other than ref,
+// dev, and inum. One must hold ip->lock in read or write mode
+// before accessing ip->valid, ip->size, ip->type, &c.
 
 struct {
   struct spinlock lock;
@@ -186,7 +187,7 @@ iinit()
   
   initlock(&itable.lock, "itable");
   for(i = 0; i < NINODE; i++) {
-    initsleeplock(&itable.inode[i].lock, "inode");
+    initrwlock(&itable.inode[i].lock, "inode");
   }
 }
 
@@ -299,7 +300,7 @@ ilock(struct inode *ip)
   if(ip == 0 || ip->ref < 1)
     panic("ilock");
 
-  acquiresleep(&ip->lock);
+  acquirewrite_blocking(&ip->lock);
 
   if(ip->valid == 0){
     bp = bread(ip->dev, IBLOCK(ip->inum, sb));
@@ -321,10 +322,33 @@ ilock(struct inode *ip)
 void
 iunlock(struct inode *ip)
 {
-  if(ip == 0 || !holdingsleep(&ip->lock) || ip->ref < 1)
+  if(ip == 0 || !holdingwrite(&ip->lock) || ip->ref < 1)
     panic("iunlock");
 
-  releasesleep(&ip->lock);
+  releasewrite(&ip->lock);
+}
+
+int
+ilock_read(struct inode *ip)
+{
+  if(ip == 0 || ip->ref < 1)
+    panic("ilock_read");
+
+  acquireread_blocking(&ip->lock);
+  if(ip->valid == 0){
+    releaseread(&ip->lock);
+    return -1;
+  }
+  return 0;
+}
+
+void
+iunlock_read(struct inode *ip)
+{
+  if(ip == 0 || ip->ref < 1)
+    panic("iunlock_read");
+
+  releaseread(&ip->lock);
 }
 
 // Drop a reference to an in-memory inode.
@@ -343,8 +367,8 @@ iput(struct inode *ip)
     // inode has no links and no other references: truncate and free.
 
     // ip->ref == 1 means no other process can have ip locked,
-    // so this acquiresleep() won't block (or deadlock).
-    acquiresleep(&ip->lock);
+    // so this acquire won't block (or deadlock).
+    acquirewrite_blocking(&ip->lock);
 
     release(&itable.lock);
 
@@ -353,7 +377,7 @@ iput(struct inode *ip)
     iupdate(ip);
     ip->valid = 0;
 
-    releasesleep(&ip->lock);
+    releasewrite(&ip->lock);
 
     acquire(&itable.lock);
   }
@@ -443,6 +467,31 @@ bmap(struct inode *ip, uint bn)
   panic("bmap: out of range");
 }
 
+static char zeroblock[BSIZE];
+
+static uint
+bmap_read(struct inode *ip, uint bn)
+{
+  uint addr, *a;
+  struct buf *bp;
+
+  if(bn < NDIRECT)
+    return ip->addrs[bn];
+  bn -= NDIRECT;
+
+  if(bn < NINDIRECT){
+    if((addr = ip->addrs[NDIRECT]) == 0)
+      return 0;
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    addr = a[bn];
+    brelse(bp);
+    return addr;
+  }
+
+  panic("bmap_read: out of range");
+}
+
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
 void
@@ -503,11 +552,16 @@ readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
-    uint addr = bmap(ip, off/BSIZE);
-    if(addr == 0)
-      break;
-    bp = bread(ip->dev, addr);
+    uint addr = bmap_read(ip, off/BSIZE);
     m = min(n - tot, BSIZE - off%BSIZE);
+    if(addr == 0){
+      if(either_copyout(user_dst, dst, zeroblock + (off % BSIZE), m) == -1){
+        tot = -1;
+        break;
+      }
+      continue;
+    }
+    bp = bread(ip->dev, addr);
     if(either_copyout(user_dst, dst, bp->data + (off % BSIZE), m) == -1) {
       brelse(bp);
       tot = -1;

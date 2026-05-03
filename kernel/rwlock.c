@@ -19,24 +19,42 @@ initrwlock(struct rwlock *rw, char *name)
   rw->writer_pid = 0;
 }
 
-int
-acquireread(struct rwlock *rw)
+static void
+acquireread_common(struct rwlock *rw, int interruptible, int *failed)
 {
   acquire(&rw->lk);
   rw->waiting_readers++;
   while(rw->writer || rw->waiting_writers > 0){
-    if(myproc() && killed(myproc())){
+    if(interruptible && myproc() && killed(myproc())){
       rw->waiting_readers--;
       wakeup(rw);
       release(&rw->lk);
-      return -1;
+      *failed = 1;
+      return;
     }
     sleep(rw, &rw->lk);
   }
   rw->waiting_readers--;
   rw->readers++;
   release(&rw->lk);
-  return 0;
+  *failed = 0;
+}
+
+int
+acquireread(struct rwlock *rw)
+{
+  int failed;
+
+  acquireread_common(rw, 1, &failed);
+  return failed ? -1 : 0;
+}
+
+void
+acquireread_blocking(struct rwlock *rw)
+{
+  int failed;
+
+  acquireread_common(rw, 0, &failed);
 }
 
 void
@@ -51,25 +69,46 @@ releaseread(struct rwlock *rw)
   release(&rw->lk);
 }
 
-int
-acquirewrite(struct rwlock *rw)
+static void
+acquirewrite_common(struct rwlock *rw, int interruptible, int *failed)
 {
+  struct proc *p;
+
   acquire(&rw->lk);
   rw->waiting_writers++;
   while(rw->writer || rw->readers > 0){
-    if(myproc() && killed(myproc())){
+    if(interruptible && myproc() && killed(myproc())){
       rw->waiting_writers--;
       wakeup(rw);
       release(&rw->lk);
-      return -1;
+      *failed = 1;
+      return;
     }
     sleep(rw, &rw->lk);
   }
   rw->waiting_writers--;
   rw->writer = 1;
-  rw->writer_pid = myproc()->pid;
+  p = myproc();
+  rw->writer_pid = p ? p->pid : 0;
   release(&rw->lk);
-  return 0;
+  *failed = 0;
+}
+
+int
+acquirewrite(struct rwlock *rw)
+{
+  int failed;
+
+  acquirewrite_common(rw, 1, &failed);
+  return failed ? -1 : 0;
+}
+
+void
+acquirewrite_blocking(struct rwlock *rw)
+{
+  int failed;
+
+  acquirewrite_common(rw, 0, &failed);
 }
 
 void

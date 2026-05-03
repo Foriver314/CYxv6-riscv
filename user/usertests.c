@@ -1122,7 +1122,7 @@ sharedfd(char *s)
     if(xstatus != 0)
       exit(xstatus);
   }
-  
+
   close(fd);
   fd = open("sharedfd", 0);
   if(fd < 0){
@@ -1144,6 +1144,81 @@ sharedfd(char *s)
     exit(0);
   } else {
     printf("%s: nc/np test fails\n", s);
+    exit(1);
+  }
+}
+
+void
+sharedfdread(char *s)
+{
+  int fd, pid, p[2], status;
+  int child[2], mine[2];
+  enum { N = 4096 };
+  uchar c;
+
+  unlink("sharedfdr");
+  fd = open("sharedfdr", O_CREATE|O_RDWR);
+  if(fd < 0){
+    printf("%s: cannot create sharedfdr\n", s);
+    exit(1);
+  }
+  for(int i = 0; i < N; i++){
+    c = i;
+    if(write(fd, &c, 1) != 1){
+      printf("%s: write failed\n", s);
+      exit(1);
+    }
+  }
+  close(fd);
+
+  fd = open("sharedfdr", 0);
+  if(fd < 0){
+    printf("%s: cannot open sharedfdr\n", s);
+    exit(1);
+  }
+  if(pipe(p) < 0){
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+
+  pid = fork();
+  if(pid < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(pid == 0){
+    close(p[0]);
+    child[0] = child[1] = 0;
+    while(read(fd, &c, 1) == 1){
+      child[0]++;
+      child[1] += c;
+    }
+    if(write(p[1], child, sizeof(child)) != sizeof(child))
+      exit(1);
+    close(p[1]);
+    close(fd);
+    exit(0);
+  }
+
+  close(p[1]);
+  mine[0] = mine[1] = 0;
+  while(read(fd, &c, 1) == 1){
+    mine[0]++;
+    mine[1] += c;
+  }
+  if(read(p[0], child, sizeof(child)) != sizeof(child)){
+    printf("%s: pipe read failed\n", s);
+    exit(1);
+  }
+  close(p[0]);
+  close(fd);
+  unlink("sharedfdr");
+  if(wait(&status) < 0 || status != 0){
+    printf("%s: child failed\n", s);
+    exit(1);
+  }
+  if(mine[0] + child[0] != N || mine[1] + child[1] != 522240){
+    printf("%s: shared read offset failed\n", s);
     exit(1);
   }
 }
@@ -3266,6 +3341,7 @@ struct test {
   {reparent2, "reparent2"},
   {mem, "mem"},
   {sharedfd, "sharedfd"},
+  {sharedfdread, "sharedfdread"},
   {fourfiles, "fourfiles"},
   {createdelete, "createdelete"},
   {unlinkread, "unlinkread"},

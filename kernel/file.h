@@ -1,6 +1,7 @@
 struct file {
   enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
   int ref; // reference count
+  struct sleeplock offlock;
   char readable;
   char writable;
   struct pipe *pipe; // FD_PIPE
@@ -18,7 +19,7 @@ struct inode {
   uint dev;           // Device number
   uint inum;          // Inode number
   int ref;            // Reference count
-  struct sleeplock lock; // protects everything below here
+  struct rwlock lock; // protects everything below here
   int valid;          // inode has been read from disk?
 
   short type;         // copy of disk inode
