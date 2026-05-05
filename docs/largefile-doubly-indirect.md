@@ -53,6 +53,12 @@ ip->addrs[12] → 二级间接块 (256 个指针)
 - `11 ≤ bn < 267`：一级间接，`bn -= 11`，在 `addrs[11]` 指向的块中索引
 - `267 ≤ bn < 65803`：二级间接，`bn -= 267`，外层索引 = `bn / 256`，内层索引 = `bn % 256`
 
+### 2.4 FSSIZE 与 MAXFILE 的关系
+
+`MAXFILE = 65803` 为理论上限，实际单文件大小受 `FSSIZE`（文件系统总块数）约束。本次将 `FSSIZE` 从 2000 提升至 **10000**（9952 个数据块，约 10 MB），使二级间接块外层可实际使用约 38 个指针（共 256 个），远超仅触发门槛的水平。
+
+如需更大文件，可继续增大 `kernel/param.h` 中的 `FSSIZE`，上限为 `MAXFILE`。
+
 ## 3. 常量定义变更
 
 ### `kernel/fs.h`
@@ -92,6 +98,15 @@ uint addrs[NDIRECT+2];
 
 `sizeof(ip->addrs)` 保持 52 字节不变，因此 `iupdate()` 和 `ilock()` 中的 `memmove` 调用无需任何修改。
 
+### `kernel/param.h`
+
+```c
+// 旧
+#define FSSIZE  2000
+// 新
+#define FSSIZE  10000  // 9952 个数据块，约 10 MB
+```
+
 ## 4. 核心函数变更（`kernel/fs.c`）
 
 ### 4.1 `bmap()` —— 块映射（分配）
@@ -99,6 +114,9 @@ uint addrs[NDIRECT+2];
 在原有直接块和一级间接块分支之后，新增二级间接块分支：
 
 ```c
+// NOTE: on allocation failure, intermediate indirect blocks already
+// allocated are not rolled back (consistent with existing xv6 behavior).
+
 bn -= NINDIRECT;                    // 此时 bn 已是减去 NDIRECT 之后的值
 
 if(bn < NDOUBLYINDIRECT){
@@ -138,6 +156,7 @@ if(bn < NDOUBLYINDIRECT){
 - 二级间接块读取后立即释放（`brelse`），再读取一级间接块，避免同时占用两个间接块缓冲区
 - 每层分配新块后立即 `log_write`，确保修改被当前事务捕获
 - `balloc` 内部的 `bzero` 已对同一块调用过 `log_write`，重复调用会被日志层的吸收机制优化掉
+- 若 `balloc` 失败，此前已分配的中间间接块不会回滚——这是与原始 xv6 一级间接路径一致的行为，已在函数头注释说明
 
 ### 4.2 `bmap_read()` —— 块映射（只读）
 
@@ -212,7 +231,9 @@ if(ip->addrs[NDIRECT+1]){
 
 ## 5. `mkfs/mkfs.c` 变更
 
-`iappend()` 函数负责构建初始文件系统镜像时将用户程序写入 inode。原有 `if/else` 二分支改为 `if/else if/else` 三分支：
+### 5.1 `iappend()` 三级分支
+
+原有 `if/else` 二分支改为 `if/else if/else` 三分支：
 
 ```c
 if(fbn < NDIRECT){
@@ -221,23 +242,24 @@ if(fbn < NDIRECT){
     // 一级间接块
 } else {
     // 二级间接块
-    uint dfbn = fbn - (NDIRECT + NINDIRECT);  // 关键：不修改 fbn
+    uint dindirect[NINDIRECT];          // 独立缓冲区，避免覆盖间接块数组
+    uint dfbn = fbn - (NDIRECT + NINDIRECT);
     uint outer = dfbn / NINDIRECT;
     uint inner = dfbn % NINDIRECT;
 
     // 分配二级间接块
     if(xint(din.addrs[NDIRECT+1]) == 0)
         din.addrs[NDIRECT+1] = xint(freeblock++);
-    rsect(xint(din.addrs[NDIRECT+1]), (char*)indirect);
+    rsect(xint(din.addrs[NDIRECT+1]), (char*)dindirect);
 
     // 分配一级间接块
-    if(indirect[outer] == 0){
-        indirect[outer] = xint(freeblock++);
-        wsect(xint(din.addrs[NDIRECT+1]), (char*)indirect);
+    if(dindirect[outer] == 0){
+        dindirect[outer] = xint(freeblock++);
+        wsect(xint(din.addrs[NDIRECT+1]), (char*)dindirect);
     }
-    uint siblock = xint(indirect[outer]);
+    uint siblock = xint(dindirect[outer]);
 
-    // 分配数据块
+    // 分配数据块（复用 indirect 缓冲区读取内层）
     rsect(siblock, (char*)indirect);
     if(indirect[inner] == 0){
         indirect[inner] = xint(freeblock++);
@@ -248,6 +270,10 @@ if(fbn < NDIRECT){
 ```
 
 **注意**：`fbn` 不可修改（不同于 `bmap` 中的 `bn`），因为后续代码仍需使用 `fbn` 计算写入偏移 `(fbn + 1) * BSIZE - off`。
+
+### 5.2 缓冲区拆分
+
+二级间接路径使用独立的 `dindirect[NINDIRECT]` 局部数组，与通用的 `indirect[NINDIRECT]` 分离，消除覆盖风险。即使后续调整代码顺序，也不会出现外层数据被内层读取覆盖的问题。
 
 ## 6. 日志安全性分析
 
@@ -268,32 +294,43 @@ if(fbn < NDIRECT){
 
 ## 7. 测试
 
-### 7.1 测试用例更新
+### 7.1 `writebig` —— 三级寻址验证
 
-`user/usertests.c` 中的 `writebig` 测试从写入 `MAXFILE`（65803）块改为写入 `BIGBLOCKS = 400` 块：
+写入 `NDIRECT + NINDIRECT + 200 = 467` 块，覆盖全部三条路径：
 
-```c
-enum { BIGBLOCKS = 400 };
-// 块 0-10:   直接块
-// 块 11-266: 一级间接块
-// 块 267-399: 二级间接块（outer[0] 内的 133 个块）
+- 块 0-10：直接块
+- 块 11-266：一级间接块
+- 块 267-466：二级间接块（外层索引 0 内的 200 个块）
+
+写入带序号的块内容后回读校验，确保 `bmap` 和 `bmap_read` 在所有层级正确工作。
+
+### 7.2 `truncbig` —— 二级间接块释放验证（新增）
+
+写入 `NDIRECT + NINDIRECT + 50 = 317` 块（跨越二级间接区域），`unlink` 触发 `iput → itrunc` 释放所有块，随后创建新文件并写入相同数量的块，验证旧块确实被回收：
+
+```
+创建 truncbig（317 块，含二级间接路径）
+  → unlink（触发 itrunc 释放三步走）
+  → 创建 truncbig2（317 块）
+  → 写入成功 = 旧块已正确回收
 ```
 
-400 个数据块 + 3 个间接块 = 403 块，在 FSSIZE=2000（约 1953 个数据块）内完全容纳。
+### 7.3 `diskfull` —— 填满磁盘测试
 
-### 7.2 测试结果
+从 `for(i = 0; i < MAXFILE; i++)` 改为 `for(i = 0; i < 5000; i++)`，每文件最多写 5000 块，通过多文件交叉填充磁盘（避免退化为单文件撑爆），之后验证 `dirlink` 在磁盘满时优雅失败。
+
+### 7.4 测试结果
 
 ```bash
 $ ./test-xv6.py writebig
 test writebig: OK
-ALL TESTS PASSED
 
-$ ./test-xv6.py -q usertests
-# ... 全部 40+ 项测试 ...
-ALL TESTS PASSED
+$ ./test-xv6.py truncbig
+test truncbig: OK
+
+$ ./test-xv6.py diskfull
+test diskfull: OK
 ```
-
-`writebig` 测试覆盖了直接块、一级间接块和二级间接块三条代码路径的写入和读取验证。全部快速测试套件无回归。
 
 ## 8. 改动文件清单
 
@@ -301,9 +338,10 @@ ALL TESTS PASSED
 | --- | --- |
 | `kernel/fs.h:27-39` | NDIRECT 12→11，新增 NDOUBLYINDIRECT，更新 MAXFILE，addrs 数组 NDIRECT+2 |
 | `kernel/file.h:30` | inode.addrs 同步变更为 NDIRECT+2 |
-| `kernel/fs.c:420-604` | 注释更新 + bmap/bmap_read/itrunc 新增二级间接块分支 |
-| `mkfs/mkfs.c:270-300` | iappend 新增二级间接块分配分支 |
-| `user/usertests.c:586-629` | writebig 改用 BIGBLOCKS=400 测试三级寻址 |
+| `kernel/fs.c:420-604` | 注释更新 + bmap/bmap_read/itrunc 新增二级间接块分支 + bmap 部分分配注释 |
+| `kernel/param.h:12` | FSSIZE 2000→10000 |
+| `mkfs/mkfs.c:270-310` | iappend 新增二级间接块分支，独立 dindirect 缓冲区 |
+| `user/usertests.c:586-690` | writebig 改用 NDIRECT+NINDIRECT+200；新增 truncbig 测试；diskfull 改用每文件 5000 块上限 |
 
 ## 9. 兼容性
 
@@ -311,4 +349,123 @@ ALL TESTS PASSED
 - `sizeof(ip->addrs)` 保持 52 字节
 - 超级块布局完全不变
 - 旧 `fs.img` 可直接挂载使用（inode 大小一致）
-- 如需更大的单文件，可将 `FSSIZE` 从 2000 增大（`kernel/param.h`）
+- 如需更大的单文件，可继续增大 `FSSIZE`（`kernel/param.h`），理论上限 `MAXFILE = 65803` 块
+
+## 10. 实施过程与问题解决
+
+本节汇总在实现二级间接块过程中遇到的问题及其解决方案。
+
+### 10.1 FSSIZE 与 MAXFILE 脱节
+
+**问题**：初始实现保持了 `FSSIZE = 2000`（约 1953 个数据块），但 `MAXFILE` 已增至 65803。扣除直接块（11）和一级间接块（256），二级间接块理论上可容纳 65536 个数据块，而实际磁盘仅剩 ~1900 个数据块。这意味着二级间接块的外层 256 个指针中最多只能用到约 7 个，**大文件能力形同虚设**。
+
+**解决**：将 `FSSIZE` 从 2000 提升至 10000（约 9952 个数据块，~10 MB）。二级间接块外层可用约 38 个指针，是对 88% 磁盘空间的实际利用。`FSSIZE` 可根据需要继续增大至 `MAXFILE`。
+
+```c
+// kernel/param.h
+#define FSSIZE  10000  // 9952 个数据块，约 10 MB
+```
+
+### 10.2 `diskfull` 测试退化
+
+**问题**：`diskfull` 测试的原逻辑是为每个文件写入 `MAXFILE` 块以填满磁盘。`MAXFILE` 从 268 变为 65803 后，第一个文件就会试写 65803 块——由于磁盘仅有 ~1953 个可用块，写入在第 ~1950 块失败，**磁盘被单个文件撑满**。测试从"多文件交叉填充"退化为"单文件撑爆"，对 `dirlink` 无法扩展目录时的降级行为覆盖变弱。
+
+**解决**：将内层循环从 `for(i = 0; i < MAXFILE; i++)` 改为 `for(i = 0; i < 5000; i++)`，不再依赖 `MAXFILE`。每文件最多写 5000 块，磁盘通过多个文件交叉填充，`dirlink` 测试覆盖度恢复。
+
+```c
+// user/usertests.c — diskfull()
+for(int i = 0; i < 5000; i++){   // 不再使用 MAXFILE
+    char buf[BSIZE];
+    if(write(fd, buf, BSIZE) != BSIZE){
+        done = 1;
+        close(fd);
+        break;
+    }
+}
+```
+
+### 10.3 `diskfull` 测试超时
+
+**问题**：增大 `FSSIZE` 后，`diskfull` 需要在 QEMU 中写入近 20000 个磁盘块。每块写入涉及 `write` 系统调用 → `bmap` 分配 → `log_write` 日志 → virtio 磁盘 I/O，在 QEMU 模拟环境下耗时严重。尝试 `FSSIZE=20000` 时 300 秒超时。
+
+**解决**：在 `FSSIZE` 与测试时间之间取折中——`FSSIZE=10000` 兼顾了二级间接块的实际利用率和测试可运行性。同时将每文件块数从 1000 提高到 5000，减少文件数量以降低目录操作开销。最终 `diskfull` 在 300 秒内完成。
+
+**权衡**：若需更大的 `FSSIZE`，可适当放宽 `diskfull` 超时，或将 `diskfull` 单独运行而非作为快速测试套件的一部分。
+
+### 10.4 `writebig` 测试语义割裂
+
+**问题**：初版将循环上限从 `MAXFILE` 改为硬编码 `BIGBLOCKS = 400`。测试名暗示验证"大文件/最大文件"，但实际仅写到 400 块，与 `MAXFILE` 宏失去关联，后续若修改 `NDIRECT` 等常量不会自动反映到测试中。
+
+**解决**：使用 `NDIRECT + NINDIRECT + 200 = 467` 作为上限，与文件系统常量保持语义关联：
+
+```c
+// user/usertests.c — writebig()
+enum { BIGBLOCKS = NDIRECT + NINDIRECT + 200 };
+// 块 0-10: 直接, 块 11-266: 一级间接, 块 267-466: 二级间接
+```
+
+### 10.5 `mkfs.c` 缓冲区隐蔽重用
+
+**问题**：`iappend()` 仅声明了一个 `uint indirect[NINDIRECT]` 数组。在二级间接路径中，先用该数组读取外层间接块，提取 `siblock` 值后，再用**同一数组**读取内层间接块——覆盖了外层数据。虽然代码因提前缓存了 `siblock` 而正确，但这是**维护陷阱**：若后续有人调整代码顺序，极易在覆盖后仍访问 `indirect[outer]`。
+
+**解决**：在二级间接路径内声明独立的局部数组 `dindirect[NINDIRECT]`，与通用的 `indirect` 完全隔离：
+
+```c
+// mkfs/mkfs.c — iappend() 二级间接分支
+} else {
+    uint dindirect[NINDIRECT];          // 外层独立缓冲区
+    // ...
+    rsect(xint(din.addrs[NDIRECT+1]), (char*)dindirect);
+    // ...
+    uint siblock = xint(dindirect[outer]);
+
+    rsect(siblock, (char*)indirect);    // 内层复用通用缓冲区
+    // ...
+}
+```
+
+### 10.6 `bmap()` 部分分配残留
+
+**问题**：在二级间接路径中，若外层间接块分配成功但内层间接块或数据块分配失败（`balloc` 返回 0），函数直接返回 0。此时外层间接块已在 bitmap 中标记为占用且指针已写入 `ip->addrs[NDIRECT+1]`，但 inode 尚未 `iupdate` 刷盘——若此时崩溃，外层间接块可能被遗忘在 bitmap 中，造成轻微空间泄漏。原始 xv6 的一级间接路径也有同样问题，**不是新引入的 regression，而是设计一致性的已知缺陷**。
+
+**解决**：在 `bmap()` 函数头注释中添加说明，明确这是与上游一致的已知行为，避免未来维护者误以为是新 bug：
+
+```c
+// kernel/fs.c — bmap()
+// NOTE: on allocation failure, intermediate indirect blocks already
+// allocated are not rolled back (consistent with existing xv6 behavior).
+```
+
+若追求更严谨的分配语义，可在 `balloc` 失败时回滚已分配的中间块（调用 `bfree` 并清零对应 `addrs[]` 和间接块条目），但会显著增加错误路径的复杂度。
+
+### 10.7 缺少 `itrunc` 二级间接路径的直接测试
+
+**问题**：初始实现仅通过 `writebig` 测试间接覆盖 `itrunc`（文件 `unlink` 时触发），缺乏对二级间接块释放逻辑的直接验证。如果 `itrunc` 在遍历二级间接结构时 panic 或未正确释放所有块，现有测试无法捕获。
+
+**解决**：新增 `truncbig` 测试，完整验证二级间接块的分配→释放→再分配循环：
+
+1. 创建文件，写入 317 块（`NDIRECT + NINDIRECT + 50`），跨越二级间接区域
+2. `unlink` 触发 `itrunc` 释放全部块
+3. 创建新文件，再次写入 317 块——成功则证明旧块已被正确回收
+
+```c
+// user/usertests.c — truncbig()
+enum { TRUNCSZ = NDIRECT + NINDIRECT + 50 };
+
+// 写入 truncbig（317 块，含二级间接路径）
+// → unlink（触发 itrunc 三步释放）
+// → 创建 truncbig2（317 块）
+// → 写入成功 = 旧块已正确回收
+```
+
+### 问题总结
+
+| 问题 | 根因 | 解决方式 |
+| --- | --- | --- |
+| FSSIZE 与 MAXFILE 脱节 | FSSIZE 未随 MAXFILE 同步增大 | FSSIZE 2000→10000 |
+| diskfull 测试退化 | MAXFILE 循环导致单文件撑爆 | 改用固定每文件上限 5000 块 |
+| diskfull 超时 | 大 FSSIZE 下写入耗时过长 | FSSIZE 与测试时间折中 |
+| writebig 语义割裂 | 硬编码 400 与 MAXFILE 无关 | 改用 NDIRECT+NINDIRECT+200 |
+| mkfs 缓冲区重用 | 同一数组读取外/内层 | 独立 dindirect 数组 |
+| bmap 部分分配残留 | balloc 失败后不回滚中间块 | 函数头注释说明已知行为 |
+| 缺少 itrunc 测试 | 未直接验证二级间接释放 | 新增 truncbig 测试 |

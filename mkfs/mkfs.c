@@ -284,6 +284,7 @@ iappend(uint inum, void *xp, int n)
       x = xint(indirect[fbn-NDIRECT]);
     } else {
       // Doubly-indirect
+      uint dindirect[NINDIRECT];
       uint dfbn = fbn - (NDIRECT + NINDIRECT);
       uint outer = dfbn / NINDIRECT;
       uint inner = dfbn % NINDIRECT;
@@ -291,12 +292,12 @@ iappend(uint inum, void *xp, int n)
       if(xint(din.addrs[NDIRECT+1]) == 0){
         din.addrs[NDIRECT+1] = xint(freeblock++);
       }
-      rsect(xint(din.addrs[NDIRECT+1]), (char*)indirect);
-      if(indirect[outer] == 0){
-        indirect[outer] = xint(freeblock++);
-        wsect(xint(din.addrs[NDIRECT+1]), (char*)indirect);
+      rsect(xint(din.addrs[NDIRECT+1]), (char*)dindirect);
+      if(dindirect[outer] == 0){
+        dindirect[outer] = xint(freeblock++);
+        wsect(xint(din.addrs[NDIRECT+1]), (char*)dindirect);
       }
-      uint siblock = xint(indirect[outer]);
+      uint siblock = xint(dindirect[outer]);
 
       rsect(siblock, (char*)indirect);
       if(indirect[inner] == 0){

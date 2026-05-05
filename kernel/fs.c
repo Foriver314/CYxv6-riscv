@@ -428,6 +428,8 @@ ireclaim(int dev)
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
 // returns 0 if out of disk space.
+// NOTE: on allocation failure, intermediate indirect blocks already
+// allocated are not rolled back (consistent with existing xv6 behavior).
 static uint
 bmap(struct inode *ip, uint bn)
 {

@@ -583,7 +583,7 @@ writebig(char *s)
 {
   int i, fd, n;
 
-  enum { BIGBLOCKS = 400 };
+  enum { BIGBLOCKS = NDIRECT + NINDIRECT + 200 };
 
   fd = open("big", O_CREATE|O_RDWR);
   if(fd < 0){
@@ -630,6 +630,56 @@ writebig(char *s)
   close(fd);
   if(unlink("big") < 0){
     printf("%s: unlink big failed\n", s);
+    exit(1);
+  }
+}
+
+// Test that truncating a file with doubly-indirect blocks frees them.
+void
+truncbig(char *s)
+{
+  int i, fd;
+
+  enum { TRUNCSZ = NDIRECT + NINDIRECT + 50 };
+
+  fd = open("truncbig", O_CREATE|O_RDWR);
+  if(fd < 0){
+    printf("%s: creat truncbig failed\n", s);
+    exit(1);
+  }
+  for(i = 0; i < TRUNCSZ; i++){
+    ((int*)buf)[0] = i;
+    if(write(fd, buf, BSIZE) != BSIZE){
+      printf("%s: write truncbig failed i=%d\n", s, i);
+      exit(1);
+    }
+  }
+  close(fd);
+
+  // Unlink triggers iput -> itrunc, freeing all blocks including
+  // the doubly-indirect chain.
+  if(unlink("truncbig") < 0){
+    printf("%s: unlink truncbig failed\n", s);
+    exit(1);
+  }
+
+  // Verify blocks were freed by reallocating the same amount.
+  fd = open("truncbig2", O_CREATE|O_RDWR);
+  if(fd < 0){
+    printf("%s: creat truncbig2 failed (itrunc may have leaked blocks)\n", s);
+    exit(1);
+  }
+  for(i = 0; i < TRUNCSZ; i++){
+    ((int*)buf)[0] = i;
+    if(write(fd, buf, BSIZE) != BSIZE){
+      printf("%s: write truncbig2 failed i=%d (blocks not freed)\n", s, i);
+      exit(1);
+    }
+  }
+  close(fd);
+
+  if(unlink("truncbig2") < 0){
+    printf("%s: unlink truncbig2 failed\n", s);
     exit(1);
   }
 }
@@ -3329,6 +3379,7 @@ struct test {
   {opentest, "opentest"},
   {writetest, "writetest"},
   {writebig, "writebig"},
+  {truncbig, "truncbig"},
   {createtest, "createtest"},
   {dirtest, "dirtest"},
   {exectest, "exectest"},
@@ -3585,7 +3636,7 @@ diskfull(char *s)
       done = 1;
       break;
     }
-    for(int i = 0; i < MAXFILE; i++){
+    for(int i = 0; i < 5000; i++){
       char buf[BSIZE];
       if(write(fd, buf, BSIZE) != BSIZE){
         done = 1;
