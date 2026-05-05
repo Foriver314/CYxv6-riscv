@@ -583,13 +583,15 @@ writebig(char *s)
 {
   int i, fd, n;
 
+  enum { BIGBLOCKS = 400 };
+
   fd = open("big", O_CREATE|O_RDWR);
   if(fd < 0){
     printf("%s: error: creat big failed!\n", s);
     exit(1);
   }
 
-  for(i = 0; i < MAXFILE; i++){
+  for(i = 0; i < BIGBLOCKS; i++){
     ((int*)buf)[0] = i;
     if(write(fd, buf, BSIZE) != BSIZE){
       printf("%s: error: write big file failed i=%d\n", s, i);
@@ -609,7 +611,7 @@ writebig(char *s)
   for(;;){
     i = read(fd, buf, BSIZE);
     if(i == 0){
-      if(n != MAXFILE){
+      if(n != BIGBLOCKS){
         printf("%s: read only %d blocks from big", s, n);
         exit(1);
       }
